@@ -169,6 +169,9 @@ pub struct Config {
 
     // private: set by new_half_duplex, not by the user.
     half_duplex: bool,
+
+    // private: set by new_smartcard, not by the user.
+    smartcard: bool,
 }
 
 impl Config {
@@ -207,6 +210,7 @@ impl Default for Config {
             #[cfg(any(usart_v3, usart_v4))]
             invert_rx: false,
             half_duplex: false,
+            smartcard: false,
         }
     }
 }
@@ -1123,6 +1127,35 @@ impl<'d> Uart<'d, Async> {
         )
     }
 
+    /// Create a single-wire half-duplex Uart transceiver on a single Tx pin in Smartcard mode.
+    pub fn new_smartcard<T: Instance>(
+        peri: impl Peripheral<P = T> + 'd,
+        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+        ck: impl Peripheral<P = impl CkPin<T>> + 'd,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
+        rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
+        mut config: Config,
+    ) -> Result<Self, ConfigError> {
+        config.smartcard = true;
+
+        // TODO force some configuration to simplify configure() function
+
+        new_pin!(ck, AfType::output(OutputType::PushPull, Speed::VeryHigh));
+
+        Self::new_inner(
+            peri,
+            None,
+            new_pin!(tx, AfType::output(OutputType::OpenDrain, Speed::VeryHigh)),
+            None,
+            None,
+            None,
+            new_dma!(tx_dma),
+            new_dma!(rx_dma),
+            config,
+        )
+    }
+
     /// Perform an asynchronous write
     pub async fn write(&mut self, buffer: &[u8]) -> Result<(), Error> {
         self.tx.write(buffer).await
@@ -1460,7 +1493,7 @@ fn configure(
 
         if brr < brr_min {
             #[cfg(not(usart_v1))]
-            if brr * 2 >= brr_min && kind == Kind::Uart && !cfg!(usart_v1) {
+            if brr * 2 >= brr_min && kind == Kind::Uart && !cfg!(usart_v1) && !config.smartcard {
                 over8 = true;
                 r.brr().write_value(regs::Brr(((brr << 1) & !0xF) | (brr & 0x07)));
                 #[cfg(usart_v4)]
@@ -1494,12 +1527,16 @@ fn configure(
     );
 
     r.cr2().write(|w| {
-        w.set_stop(match config.stop_bits {
-            StopBits::STOP0P5 => vals::Stop::STOP0P5,
-            StopBits::STOP1 => vals::Stop::STOP1,
-            StopBits::STOP1P5 => vals::Stop::STOP1P5,
-            StopBits::STOP2 => vals::Stop::STOP2,
-        });
+        if config.smartcard {
+            w.set_stop(vals::Stop::STOP1P5);
+        } else {
+            w.set_stop(match config.stop_bits {
+                StopBits::STOP0P5 => vals::Stop::STOP0P5,
+                StopBits::STOP1 => vals::Stop::STOP1,
+                StopBits::STOP1P5 => vals::Stop::STOP1P5,
+                StopBits::STOP2 => vals::Stop::STOP2,
+            });
+        }
 
         #[cfg(any(usart_v3, usart_v4))]
         {
@@ -1507,17 +1544,26 @@ fn configure(
             w.set_rxinv(config.invert_rx);
             w.set_swap(config.swap_rx_tx);
         }
+
+        w.set_clken(config.smartcard);
+        w.set_lbcl(config.smartcard);
     });
 
     r.cr3().modify(|w| {
         #[cfg(not(usart_v1))]
         w.set_onebit(config.assume_noise_free);
         w.set_hdsel(config.half_duplex);
+        w.set_scen(config.smartcard);
     });
 
+    {
+        let usart_regs = unsafe { stm32_metapac::usart::Usart::from_ptr(r.as_ptr()) };
+        usart_regs.gtpr().modify(|w| {
+            w.set_psc(11);
+        });
+    }
+
     r.cr1().write(|w| {
-        // enable uart
-        w.set_ue(true);
 
         if config.half_duplex {
             // The te and re bits will be set by write, read and flush methods.
@@ -1531,9 +1577,15 @@ fn configure(
             w.set_re(enable_rx);
         }
 
+        let parity = if config.smartcard {
+            Parity::ParityEven
+        } else {
+            config.parity
+        };
+
         // configure word size
         // if using odd or even parity it must be configured to 9bits
-        w.set_m0(if config.parity != Parity::ParityNone {
+        w.set_m0(if parity != Parity::ParityNone {
             trace!("USART: m0: vals::M0::BIT9");
             vals::M0::BIT9
         } else {
@@ -1541,8 +1593,8 @@ fn configure(
             vals::M0::BIT8
         });
         // configure parity
-        w.set_pce(config.parity != Parity::ParityNone);
-        w.set_ps(match config.parity {
+        w.set_pce(parity != Parity::ParityNone);
+        w.set_ps(match parity {
             Parity::ParityOdd => {
                 trace!("USART: set_ps: vals::Ps::ODD");
                 vals::Ps::ODD
@@ -1563,6 +1615,8 @@ fn configure(
             trace!("USART: set_fifoen: true (usart_v4)");
             w.set_fifoen(true);
         }
+
+        w.set_ue(true);
     });
 
     Ok(())
